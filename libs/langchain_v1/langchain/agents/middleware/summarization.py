@@ -257,7 +257,7 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
         keep: ContextSize = ("messages", _DEFAULT_MESSAGES_TO_KEEP),
         token_counter: TokenCounter = count_tokens_approximately,
         summary_prompt: str = DEFAULT_SUMMARY_PROMPT,
-        trim_tokens_to_summarize: int | None = _DEFAULT_TRIM_TOKEN_LIMIT,
+        trim_tokens_to_summarize: int | ContextFraction | None = _DEFAULT_TRIM_TOKEN_LIMIT,
         **deprecated_kwargs: Any,
     ) -> None:
         """Initialize summarization middleware.
@@ -323,7 +323,11 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
             token_counter: Function to count tokens in messages.
             summary_prompt: Prompt template for generating summaries.
             trim_tokens_to_summarize: Maximum tokens to keep when preparing messages for
-                the summarization call.
+                the summarization call. Accepts an absolute token count or a
+                `("fraction", value)` tuple resolved against the summarization model's
+                `max_input_tokens` profile field. Fractions must be greater than zero
+                and at most one, and resolve to a minimum of one token. Fractional
+                budgets require model profile information.
 
                 Pass `None` to skip trimming entirely.
         """
@@ -379,20 +383,36 @@ class SummarizationMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, R
             self.token_counter = token_counter
             self._partial_token_counter = token_counter
         self.summary_prompt = summary_prompt
-        self.trim_tokens_to_summarize = trim_tokens_to_summarize
+        self.trim_tokens_to_summarize: int | None = (
+            None if isinstance(trim_tokens_to_summarize, tuple) else trim_tokens_to_summarize
+        )
+        if isinstance(trim_tokens_to_summarize, tuple):
+            trim_context = cast("ContextSize", trim_tokens_to_summarize)
+            if trim_context[0] != "fraction":
+                msg = "trim_tokens_to_summarize only supports fractional tuples."
+                raise ValueError(msg)
+            self._validate_context_size(trim_tokens_to_summarize, "trim_tokens_to_summarize")
 
-        requires_profile = any("fraction" in clause for clause in self._trigger_clauses)
+        requires_profile = isinstance(trim_tokens_to_summarize, tuple) or any(
+            "fraction" in clause for clause in self._trigger_clauses
+        )
         if self.keep[0] == "fraction":
             requires_profile = True
-        if requires_profile and self._get_profile_limits() is None:
-            msg = (
-                "Model profile information is required to use fractional token limits, "
-                "and is unavailable for the specified model. Please use absolute token "
-                "counts instead, or pass "
-                '`\n\nChatModel(..., profile={"max_input_tokens": ...})`.\n\n'
-                "with a desired integer value of the model's maximum input tokens."
-            )
-            raise ValueError(msg)
+        if requires_profile:
+            max_input_tokens = self._get_profile_limits()
+            if max_input_tokens is None:
+                msg = (
+                    "Model profile information is required to use fractional token limits, "
+                    "and is unavailable for the specified model. Please use absolute token "
+                    "counts instead, or pass "
+                    '`\n\nChatModel(..., profile={"max_input_tokens": ...})`.\n\n'
+                    "with a desired integer value of the model's maximum input tokens."
+                )
+                raise ValueError(msg)
+            if isinstance(trim_tokens_to_summarize, tuple):
+                self.trim_tokens_to_summarize = max(
+                    1, int(max_input_tokens * trim_tokens_to_summarize[1])
+                )
 
     @override
     def before_model(

@@ -150,6 +150,91 @@ def test_summarization_middleware_initialization() -> None:
         assert isinstance(middleware.model, FakeToolCallingModel)
 
 
+@pytest.mark.parametrize(
+    ("fraction", "expected_tokens"),
+    [(0.5, 500), (1.0, 1000), (0.3339, 333), (0.0001, 1)],
+)
+def test_summary_trim_fraction_resolves_model_budget(fraction: float, expected_tokens: int) -> None:
+    """Fractional summary budgets use the model profile and retain at least one token."""
+    middleware = SummarizationMiddleware(
+        model=ProfileChatModel(), trim_tokens_to_summarize=("fraction", fraction)
+    )
+
+    assert middleware.trim_tokens_to_summarize == expected_tokens
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 0.0, 1.1, float("inf"), float("nan")])
+def test_summary_trim_fraction_rejects_invalid_values(fraction: float) -> None:
+    """Invalid fractions fail before any summary generation or fallback."""
+    with pytest.raises(ValueError, match="Fractional trim_tokens_to_summarize values"):
+        SummarizationMiddleware(
+            model=ProfileChatModel(), trim_tokens_to_summarize=("fraction", fraction)
+        )
+
+
+@pytest.mark.parametrize("profile", [None, {}])
+def test_summary_trim_fraction_requires_model_profile(profile: ModelProfile | None) -> None:
+    """Fractional trimming needs profile data even without fractional trigger or keep."""
+    with pytest.raises(ValueError, match="Model profile information is required"):
+        SummarizationMiddleware(
+            model=ProfileChatModel(profile=profile), trim_tokens_to_summarize=("fraction", 0.5)
+        )
+
+
+@pytest.mark.parametrize("context", [("tokens", 100), ("messages", 10)])
+def test_summary_trim_fraction_rejects_other_context_kinds(context: Any) -> None:
+    """Only fractional tuples are supported; absolute budgets remain plain integers."""
+    with pytest.raises(
+        ValueError, match="trim_tokens_to_summarize only supports fractional tuples"
+    ):
+        SummarizationMiddleware(model=ProfileChatModel(), trim_tokens_to_summarize=context)
+
+
+def test_summary_trim_fraction_limits_the_history_sent_for_summary() -> None:
+    """The resolved fractional budget actually trims older history, not just metadata."""
+
+    def message_count(messages: Iterable[MessageLikeRepresentation]) -> int:
+        return len(list(messages))
+
+    middleware = SummarizationMiddleware(
+        model=ProfileChatModel(profile={"max_input_tokens": 10}),
+        trim_tokens_to_summarize=("fraction", 0.2),
+        token_counter=message_count,
+    )
+    messages: list[AnyMessage] = [
+        HumanMessage(content="Old question"),
+        AIMessage(content="Old answer"),
+        HumanMessage(content="Recent question"),
+        AIMessage(content="Recent answer"),
+    ]
+
+    assert middleware._trim_messages_for_summary(messages) == messages[-2:]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+async def test_summary_trim_fraction_reaches_sync_and_async_summarizers(
+    use_async: bool,  # noqa: FBT001
+) -> None:
+    """Both summary paths pass a resolved integer budget to the message trimmer."""
+    middleware = SummarizationMiddleware(
+        model=ProfileChatModel(), trim_tokens_to_summarize=("fraction", 0.5)
+    )
+    messages: list[AnyMessage] = [HumanMessage(content="Hello"), AIMessage(content="Hi")]
+
+    with patch(
+        "langchain.agents.middleware.summarization.trim_messages", return_value=messages
+    ) as trim:
+        summary = (
+            await middleware._acreate_summary(messages)
+            if use_async
+            else middleware._create_summary(messages)
+        )
+
+    assert summary == "Summary"
+    trim.assert_called_once()
+    assert trim.call_args.kwargs["max_tokens"] == 500
+
+
 def test_summarization_middleware_no_summarization_cases() -> None:
     """Test SummarizationMiddleware when summarization is not needed or disabled."""
     model = FakeToolCallingModel()
